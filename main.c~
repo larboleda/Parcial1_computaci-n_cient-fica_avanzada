@@ -1,0 +1,184 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <malloc.h>
+#include <gsl/gsl_sort.h>
+#include <gsl/gsl_errno.h>
+#include <gsl/gsl_spline.h>
+#include "allvars.c"
+#include "functions.h" //luego hay que compilar functions.c en el make
+
+int main(int argc, char **argv)
+  
+{
+  
+  char *filename;
+  
+  printf("%d\n",argc);
+
+  if(argc != 4)
+    {
+      printf("incorrect number of arguments, use as:\n");
+      printf("%s \t Nparticles \t g:",argv[0]);
+    }
+
+  printf("\n");
+  
+  filename = argv[1];
+  Nparticles = atoi(argv[2]);
+  g = atoi(argv[3]); //number of particles in every ring
+  
+  /*declaration of other variables*/
+  int i,j;
+  FILE *pf = NULL;
+  double cx, cy;
+  double Mtot,Maccu; //total mass inside R
+  double *Sdens=NULL, *Rdens=NULL;
+
+  Nrings = Nparticles / g; //number of rings to be created
+
+  //allocate memory 
+  part = (struct particle *) malloc((size_t)Nparticles * sizeof(struct particle));
+  ring = (struct rings *) malloc((size_t)Nrings * sizeof(struct rings));
+  dc = (double *)malloc((size_t)Nparticles * sizeof(double));
+  id = (int *)malloc((size_t)Nparticles * sizeof(int));			   
+  Sdens = (double *) malloc((size_t) Nrings*sizeof(double));
+  Rdens = (double *) malloc((size_t) Nrings*sizeof(double));
+ 
+  //find the neighbors
+  printf("reading the file...charging positions\n");
+  
+  readfile(filename, Nparticles);
+  
+  printf("Finding the neighbors...\n");
+
+  construct_triangles(part);
+
+  //center of the system
+  printf("calculating the center of the system\n");
+
+  cx = 0.0;
+  cy = 0.0;
+
+  for(i=0;i<Nparticles;i++)
+    {
+      //compute the center mass
+      cx += 1.0*part[i].pos[0];
+      cy += 1.0*part[i].pos[1];   
+    }
+
+  cx = cx / Nparticles;
+  cy = cy / Nparticles;
+
+  //counter the numbers of triangles forming by each particles
+  printf("counting triangles...\n");
+  triangle_counter(part, cx, cy);
+
+  printf("filling the rings with g particles...\n");
+  int count = 0;
+
+  //fill for ring[0]
+  ring[0].radius[0] = 0.0;
+  ring[0].radius[1] = dc[g-1];
+  count = g;
+  
+  //fill the other rings
+  for(j=1;j<Nrings;j++)
+    {
+      count = count-1;
+      ring[j].radius[0] = dc[j*g - 1];
+      ring[j].radius[1] = dc[(j+1)*g -1];
+      count += g;
+    }
+  
+  printf("***ring's radii and density***\n");
+  
+  pf = fopen("density_r.dat","w"); 
+  
+  //ring's width, surface density, and radii
+  
+  //fill ring[1]
+  ring[1].width =  ring[1].radius[1] - ring[1].radius[0];
+  ring[1].r = 0.5 *(ring[1].radius[1] + ring[1].radius[0]);
+  ring[1].density = g*1.0 / (M_PI *(ring[1].radius[1]*ring[1].radius[1] - ring[1].radius[0]*ring[1].radius[0])); //density = #particles * mass / ring's area
+  
+  //fill ring[0] such that ring[1].density = ring[0].density (extrapolation for r = 0)
+  ring[0].width =  ring[0].radius[1] - ring[0].radius[0];
+  ring[0].r = 0.0;
+  ring[0].density = g*1.0 / (M_PI *(ring[0].radius[1]*ring[0].radius[1] - ring[0].radius[0]*ring[0].radius[0])); 
+  
+  fprintf(pf,"%lf %lf\n",ring[0].r,ring[0].density);
+  fprintf(pf,"%lf %lf\n",ring[1].r,ring[1].density);
+
+  //fill the other rings
+  for(j=2;j<Nrings;j++)
+    {
+      ring[j].width =  ring[j].radius[1] - ring[j].radius[0];
+      ring[j].r = 0.5 *(ring[j].radius[1] + ring[j].radius[0]);
+      ring[j].density = g*1.0 / (M_PI *(ring[j].radius[1]*ring[j].radius[1] - ring[j].radius[0]*ring[j].radius[0])); 
+      
+      fprintf(pf,"%lf %lf\n",ring[j].r,ring[j].density);
+      
+    }
+  
+  fclose(pf);
+
+  //accumulative mass : composite simpson rule
+  
+  Mtot = composite_simpson(ring,Nrings, 0.0 , ring[Nrings-1].r);
+  
+  printf("Mtot = %lf\n",Mtot);
+
+ //acumulative mass profile
+
+  printf("calculating accumulative mass profile\n");
+
+  pf = fopen("mass_profile.dat","w");
+  
+  Maccu = 0.0;
+  for(j=1; j<=Nrings; j++) 
+    {
+      Maccu = composite_simpson(ring,j, 0.0 , ring[j-1].r);
+      fprintf(pf,"%lf %lf\n",Maccu,ring[j-1].r);    
+    }
+
+  fclose(pf);
+ 
+  //bisection method to obtein Re for witch density is a factor of "e" of the central density
+
+  printf("interpolating data set... %d\n", Nrings);
+
+  //fill the arrays of density (Sdens) and readii (Rdens) with data from rhe structure ring
+   
+  for(i=0; i<Nrings; i++)
+    {
+      Sdens[i] = ring[i].density;
+      Rdens[i] = ring[i].r;
+      printf("%lf %lf\n",Sdens[i],Rdens[i]);
+    }
+  
+  //define gsl stuff for interplation
+  
+  gsl_spline *spline = gsl_spline_alloc (gsl_interp_cspline, (size_t) Nrings);
+  gsl_interp_accel *acc = gsl_interp_accel_alloc (); //returns a pointer to an accelerator object                                                                        
+  //call the interpolation routine          
+  my_interpolation(Nrings, Sdens, Rdens, spline, acc);
+    
+  //find the roots for the ecuation of density as a function of r: S(r) - (So /e) = 0. We need to find the solution r.
+  double Rroot = spline_root(spline,
+			     acc,
+			     Sdens[0]/M_E,
+			     0.0,ring[Nrings-1].r,
+			     1E-15,
+			     1000);
+
+  printf("Root is r = %e\n",Rroot);
+  
+  free(ring);
+  
+  return 0;
+  
+}				   
+	 
+
+    
